@@ -2,7 +2,38 @@ import tps
 import numpy as np
 import matplotlib.pyplot as plt
 
-from scipy import ndimage
+from scipy import ndimage, signal
+
+class Peak():
+    def __init__(self, *args, **kwds):
+        self.update(*args, **kwds)
+
+    def update(self, w, u, s):
+        self.w = w
+        self.u = u
+        self.s = s
+
+    def get(self):
+        return self.w, self.u, self.s
+
+class PeakArray():
+    def __init__(self, w0 = [], u0 = [], s0 = []):
+        self.peaks = [Peak(*theta) for theta in zip(w0,u0,s0)]
+        self.w, self.u, self.s = self.get()
+
+    def update(self):
+        self.w, self.u, self.s = self.get()
+
+    def get(self, idx = None):
+        if idx is None:
+            vals = [p.get() for p in self.peaks]
+        else:
+            vals = [self.peaks[i].get() for i in idx]
+        return [np.array(i) for i in zip(*vals)]
+
+    def in_region(self, r, cog):
+        dst = np.sqrt(np.sum((self.u - cog)**2, 1))
+        return np.nonzero(dst < r)[0]
 
 class Flood():
     def __init__(self, f):
@@ -32,31 +63,62 @@ class Flood():
         redge = len(p) - np.argmax(p[::-1] > thresh)
         return np.array([ledge, redge])
 
+    def find_1d_peaks(self, axis = 0, quantile = 0.5):
+        s = np.sum(self.fld, axis)
+        cog = np.average(np.arange(len(s)), weights = s**2)
+
+        height = np.quantile(s, quantile)
+        pks, other = signal.find_peaks(s, height, distance = 5)
+        actual_height = other['peak_heights']
+        order = actual_height.argsort()[::-1]
+
+        pks = pks[order]
+        actual_height = actual_height[order]
+
+        center_pk_idx = pks[np.argmin(np.abs(pks - cog))]
+        lpeak_idx = list(pks[pks < center_pk_idx])
+        rpeak_idx = list(pks[pks > center_pk_idx])
+
+        all_pks = lpeak_idx[:9] + [center_pk_idx] + rpeak_idx[:9]
+
+        for pk in pks:
+            if len(all_pks) >= 19:
+                break
+            elif pk not in all_pks:
+                all_pks.append(pk)
+
+        return all_pks
+
+    def estimate_peaks(self):
+        ta = self.find_1d_peaks(1)
+        ax = self.find_1d_peaks(0)
+        return np.array(np.meshgrid(ta, ax)).reshape(2,ncry2)
+
     def init_mask(self, ncrystals = 19):
-        ta_edges = edges(self.fld, 1)
-        ax_edges = edges(self.fld, 0)
         ncry2 = ncrystals**2 
-
-        ta = np.linspace(*ta_edges, ncrystals)
-        ax = np.linspace(*ax_edges, ncrystals)
-        mu0 = np.array(np.meshgrid(ta, ax)).reshape(2,ncry2)
-
+        mu0 = self.estimate_peaks()
         w0 = np.array(1.0/ncry2).repeat(ncry2)
 
+        ta_edges = self.edges(1)
+        ax_edges = self.edges(0)
         ta_diff = np.diff(ta_edges)[0] / ncrystals
         ax_diff = np.diff(ax_edges)[0] / ncrystals
         sigma0 = np.array([[ta_diff,0],[0,ax_diff]])[None,...].repeat(ncry2, axis = 0)
 
-        return (w0, mu0.T, sigma0)
+        return PeakArray(w0, mu0.T, sigma0)
 
 class Gmm():
     @staticmethod
-    def gauss(c, mu, sigma):
-        sigma_i = np.linalg.inv(sigma)
-        norm = 1.0 / np.sqrt(4 * np.linalg.det(sigma) * np.pi**2)
+    def gaussian(c, w, mu, s):
+        sigma_i = np.linalg.inv(s)
+        sigma_d = np.linalg.det(s)
+
+        # i->events,j/k->dimension of gaussian(2)
+        # exp_val = -1/2 * (x @ sigma^-1 @ x.T)
+        # (i,) array of scalars to pass to exp
         x = c.T - mu
-        x = np.sum((x @ sigma_i) * x, axis = 1)
-        return norm * np.exp(-0.5 * x)
+        x = np.einsum('ij,jk,ij->i', x, -sigma_i/2, x)
+        return w * np.exp(x) / np.sqrt((2*np.pi)**2 * sigma_d)
 
     def __init__(self, f, nsamples = 100_000):
         self.fld = Flood(f)
@@ -64,52 +126,90 @@ class Gmm():
         sz = self.fld.fld.shape[0]
         self.fld0, *_ = np.histogram2d(*self.samples, sz, [[0,sz-1],[0,sz-1]])
 
-    def gaussian(self, mu, sigma, sigma_default = 100):
-        """
-        try:
-            sigma_i = np.linalg.inv(sigma)
-            norm = 1.0 / np.sqrt(4 * np.linalg.det(sigma) * np.pi**2)
-            if np.any(np.abs(sigma_i) > 1e10): raise np.linalg.LinAlgError
-        except:
-            sigma_i = np.eye(2) / sigma_default
-            norm = 1.0 / (2 * np.pi * sigma_default**2)
-        """
-
-        sigma_i = np.linalg.inv(sigma)
-        norm = 1.0 / np.sqrt(4 * np.linalg.det(sigma) * np.pi**2)
-        x = self.samples.T - mu
-        x = np.sum((x @ sigma_i) * x, axis = 1)
-        return norm * np.exp(-0.5 * x)
-
-    def e_step(self, w, mu, sigma):
-        g = np.array([self.gaussian(u,s) for u,s in zip(mu,sigma)])
-        g *= w[:,None]
+    def e_step(self, samp, w, mu, s):
+        g = np.array([Gmm.gaussian(samp, *theta) for theta in zip(w,mu,s)])
         g /= g.sum(0)
         q = g.sum(1)
-        q[q == 0] = 1e-6
         return g, q
 
-    def m_step(self, g, q):
-        w = q / g.shape[1] 
-        mu = (np.sum(self.samples[:,None,:] * g, 2) / q).T
-        sigma = self.samples.T[:,None,:] - mu
-        sigma = sigma.T * g
-        sigma = np.moveaxis(sigma, 0, 1)
-        sigma = sigma @ np.moveaxis(sigma, 1, 2)
-        sigma /= q[:,None,None]
-        return w, mu, sigma
+    def m_step(self, samp, g, q):
+        w1  = q / g.shape[1] 
+        mu1 = (g @ samp.T) / q[:,None]
 
-    def fit(self, pars = None, niter = 10):
-        w, mu, sigma = pars if pars else self.fld.init_mask()
+        # k->events, l->features, i/j->coords
+        # sigma_l = sum_k {(ck.T @ ck) * gkl} / ql
+        # l x 2 x 2 matrix of sigmas
+        c   = samp.T[:,None,:] - mu1
+        s1  = np.einsum('kli,klj,lk,l->lij',c,c,g,1/q)
+        return w1, mu1, s1
 
-        for i in range(niter):
-            g, q = self.e_step(w, mu, sigma)
-            w, mu_new, sigma = self.m_step(g, q)
-            tps_map = tps.f(mu, mu_new)
-            mu = np.array([tps_map(*ui) for ui in mu])
+    def fit(self, niter = 10):
+        pks = self.fld.init_mask()
 
-            plt.imshow(self.fld0.T)
-            plt.scatter(*mu.T, s = 4, color = 'red')
-            plt.show()
+        r = 0
+        done = set()
+        cog = np.array(ndimage.center_of_mass(self.fld0)[::-1])
 
-        return w, mu, sigma
+        sz = self.fld.fld.shape[0]
+        self.fld0, *_ = np.histogram2d(*self.samples, sz, [[0,sz-1],[0,sz-1]])
+
+        plt.imshow(self.fld0.T)
+        plt.scatter(*pks.u.T, s = 4, color = 'red')
+        plt.show()
+
+        for _ in range(10000):
+            print(len(done))
+            r += 1 
+            current = pks.in_region(r, cog)
+            new = list(set(current) - done)
+            nnew = len(new)
+
+            if nnew > 0:
+                samples_dst = np.sqrt(np.sum((self.samples - cog[:,None])**2, 0))
+                c = self.samples[:,samples_dst < r]
+                self.fld0, *_ = np.histogram2d(*c, sz, [[0,sz-1],[0,sz-1]])
+
+                converged = np.array([False] * nnew)
+                ll_old = np.array([-np.inf] * nnew)
+
+                while not np.all(converged):
+                    #w_v, mu_v, s_v = w[cur,], mu[cur,], s[cur,]
+                    w, u, s = pks.get(current)
+                    g, q = self.e_step(c, w, u, s)
+                    w_new, u_new, s_new = self.m_step(c, g, q)
+
+                    ll_new = np.array([np.mean(np.log(gi + np.finfo('float').eps)) for gi in g])
+
+                    """
+                    if nnew > 1:
+                        tps_map = tps.f(mu_v, mu_new)
+                        mu[new] = np.array([tps_map(*ui) for ui in mu_new[:nnew,]])
+                    else:
+                        mu[new] = mu_new[:nnew,]
+                    """
+
+                    for i in range(len(current)):
+                        idx = current[i]
+                        if idx in new:
+                            new_idx = new.index(idx)
+                            converged[new_idx] = (ll_new[i] - ll_old[new_idx]) < 1e-6
+                            ll_old[new_idx] = ll_new[i]
+
+                            wi,ui,si = w_new[i,], u_new[i,], s_new[i,]
+                            pks.peaks[idx].update(wi,ui,si)
+
+                    pks.update()
+
+                    """
+                    mu[new] = mu_new[:nnew,]
+                    w[new] = w_new[:nnew,]
+                    s[new] = s_new[:nnew,]
+                    """
+
+                    plt.imshow(self.fld0.T)
+                    plt.scatter(*pks.u.T, s = 4, color = 'red')
+                    plt.show()
+
+                done = set(current)
+
+

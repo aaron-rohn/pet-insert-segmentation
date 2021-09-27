@@ -2,14 +2,13 @@ import numpy as np
 
 def U(pi, pj):
     r2 = np.sum((pi - pj)**2, 1)
-    return r2 * np.log(r2 + np.finfo(float).eps)
+    return r2 * np.log(r2 + np.finfo('float').eps)
 
 def K(p):
     n = len(p)
     idx = np.arange(n)
-    idx_i = np.tile(idx, n)
-    idx_j = idx.repeat(n)
-    return U(p[idx_i], p[idx_j]).reshape(n,n)
+    i, j = [k.flatten() for k in np.meshgrid(idx,idx)]
+    return U(p[i],p[j]).reshape(n,n)
 
 def Z(p):
     b = np.append(np.ones((p.shape[0],1)), p, 1)

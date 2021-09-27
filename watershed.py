@@ -40,7 +40,7 @@ def calc_voronoi(size, peaks):
     subdiv.insert(peaks)
 
     facets, centers = subdiv.getVoronoiFacetList([])
-
+    
     grid_points = [(x,y) for x in range(size[0]) for y in range(size[1])]
     ret = map(subdiv.findNearest, grid_points)
     grid = np.asarray([t[0] for t in ret])
